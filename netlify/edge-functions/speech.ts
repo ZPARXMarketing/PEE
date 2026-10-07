@@ -36,7 +36,7 @@ export default async (req: Request) => {
 
   try {
     const out = await synthesize(apiKey, body, pickSpeechModel(list, body.model || defaultModel), {
-      'HTTP-Referer': Netlify.env.get('URL') || 'https://github.com/ZPARXMarketing/PassiveExpertiseEngine',
+      'HTTP-Referer': Netlify.env.get('URL') || 'https://github.com/ZPARXMarketing/PEE',
     })
     if (!out.ok) return json({ error: `Voice service returned ${out.status}: ${out.detail || 'no detail'}` }, 502)
     // most models honour mp3; pass through whatever came back (some send raw pcm)

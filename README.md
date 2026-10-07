@@ -26,8 +26,8 @@ Open source under the [MIT license](LICENSE). Bring your own [OpenRouter](https:
 **2. Try it on your computer (3 minutes, no accounts besides OpenRouter).**
 
 ```bash
-git clone https://github.com/ZPARXMarketing/PassiveExpertiseEngine
-cd PassiveExpertiseEngine
+git clone https://github.com/ZPARXMarketing/PEE
+cd PEE
 npm install
 npm run dev
 ```
