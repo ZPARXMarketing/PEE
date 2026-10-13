@@ -19,8 +19,12 @@ import { EMPTY_AVAILABILITY, planSchedule, priorityOrder, weeklyMinutes, type Pa
 import { childrenOrGenerate } from './tree.ts'
 import {
   chainIds,
+  lectureSections,
   liveKey,
   type Availability,
+  type Batch,
+  type BatchItem,
+  type BatchOptions,
   type Bucket,
   type Path,
   type CheckResult,
@@ -35,6 +39,7 @@ import {
 } from './types.ts'
 import { Column, type Fold } from './Column.tsx'
 import { Library } from './Library.tsx'
+import { PathLectures } from './PathLectures.tsx'
 import { AudioProvider } from './MiniPlayer.tsx'
 import { Reader } from './Reader.tsx'
 import type { ToolCtx } from './Study.tsx'
@@ -158,6 +163,12 @@ export default function App() {
   const [lectures, setLectures] = useState<Extra[]>([])
   /** lectures being made in the background, by busy key */
   const [jobs, setJobs] = useState<Record<string, { chapterId: string; label: string; status: string }>>({})
+  /** the path batch (one at a time) and whose path-lectures sheet is open */
+  const [batch, setBatch] = useState<Batch | null>(null)
+  const batchRef = useRef(batch)
+  batchRef.current = batch
+  const stopBatch = useRef(false)
+  const [batchSheet, setBatchSheet] = useState('')
   /** chapter whose lecture sheet should open (from the pill) */
   const [openLectures, setOpenLectures] = useState('')
   // "ready" pills clear themselves after a while; failures stay until dismissed
@@ -279,40 +290,48 @@ export default function App() {
    * A chapter's text: from the store, or written once (streamed onto the page) and saved.
    * After a chapter the learner opened, the next one is written in the background.
    */
+  const writeLesson = useCallback(
+    async (chapter: TreeNode, trail: string[], siblings: TreeNode[]): Promise<Lesson> => {
+      if (!store) throw new Error('Still loading. Try again.')
+      const stored = await store.doc<Lesson>(chapter.id)
+      if (stored) return stored
+      if (!siblings.length && chapter.parent_id) siblings = await store.children(chapter.parent_id)
+      const { text, model } = await generate(
+        {
+          kind: 'chapter',
+          trail,
+          chapter: {
+            title: chapter.title,
+            summary: chapter.summary,
+            index: Math.max(0, siblings.findIndex((s) => s.id === chapter.id)),
+            outline: siblings.map((s) => s.title),
+          },
+        },
+        settings,
+        (t) => throttle(`lesson:${chapter.id}`, () => setDocs((d) => ({ ...d, [chapter.id]: parseLesson(t) }))),
+      )
+      const lesson = parseLesson(text)
+      if (!lesson.sections.length) throw new Error('The chapter came back empty. Try again.')
+      await store.saveDoc(chapter.id, lesson, model)
+      return lesson
+    },
+    [store, settings],
+  )
+
   const ensureLesson = useCallback(
     (chapter: TreeNode, trail: string[], siblings: TreeNode[], prefetchNext = false): Promise<void> =>
       run(chapter.id, async () => {
         if (!store) return
-        const [stored, ex] = await Promise.all([store.doc<Lesson>(chapter.id), store.extras(chapter.id).catch(() => [])])
-        setExtras((e) => ({ ...e, [chapter.id]: ex }))
-        let lesson = stored
         if (!siblings.length && chapter.parent_id) siblings = await store.children(chapter.parent_id)
-        if (!lesson) {
-          const { text, model } = await generate(
-            {
-              kind: 'chapter',
-              trail,
-              chapter: {
-                title: chapter.title,
-                summary: chapter.summary,
-                index: Math.max(0, siblings.findIndex((s) => s.id === chapter.id)),
-                outline: siblings.map((s) => s.title),
-              },
-            },
-            settings,
-            (t) => throttle(`lesson:${chapter.id}`, () => setDocs((d) => ({ ...d, [chapter.id]: parseLesson(t) }))),
-          )
-          lesson = parseLesson(text)
-          if (!lesson.sections.length) throw new Error('The chapter came back empty. Try again.')
-          await store.saveDoc(chapter.id, lesson, model)
-        }
+        const [lesson, ex] = await Promise.all([writeLesson(chapter, trail, siblings), store.extras(chapter.id).catch(() => [])])
+        setExtras((e) => ({ ...e, [chapter.id]: ex }))
         setDocs((d) => ({ ...d, [chapter.id]: lesson }))
         if (prefetchNext) {
           const next = siblings[siblings.findIndex((s) => s.id === chapter.id) + 1]
           if (next) void ensureLessonRef.current(next, trail, siblings)
         }
       }),
-    [run, store, settings],
+    [run, store, writeLesson],
   )
   const ensureLessonRef = useRef(ensureLesson)
   ensureLessonRef.current = ensureLesson
@@ -351,76 +370,121 @@ export default function App() {
     [run, store, settings, known],
   )
 
-  /** Rewrite only the flagged parts using the fact-check's corrections. */
+  /** Fact-check a chapter against the web and save the result. */
+  const checkLesson = useCallback(
+    async (chapter: TreeNode, trail: string[], lesson: Lesson): Promise<CheckResult> => {
+      if (!store) throw new Error('Still loading. Try again.')
+      const { text, model } = await generate(
+        {
+          kind: 'factcheck',
+          trail: trail.length ? trail : [chapter.title],
+          chapter: { title: chapter.title, summary: chapter.summary, index: 0, outline: [] },
+          context: lessonText(lesson),
+        },
+        settings,
+      )
+      const row = await store.addExtra(chapter.id, 'check', '', parseCheck(text), model)
+      setExtras((e) => ({ ...e, [chapter.id]: [...(e[chapter.id] ?? []), row] }))
+      return row.body as CheckResult
+    },
+    [store, settings],
+  )
+
+  /** Rewrite only the flagged parts using the fact-check's corrections; returns the corrected copy. */
+  const fixLesson = useCallback(
+    async (chapter: TreeNode, trail: string[], lesson: Lesson, check: CheckResult): Promise<Lesson> => {
+      if (!store) throw new Error('Still loading. Try again.')
+      const issues = check.issues
+        .map((i, n) => `${n + 1}. Claim: ${i.claim}\n   Problem: ${i.problem}\n   Correction: ${i.correction}`)
+        .join('\n')
+      const { text, model } = await generate(
+        { kind: 'fix', trail: trail.length ? trail : [chapter.title], context: lessonBlocks(lesson), issues },
+        settings,
+      )
+      const fixed = applyFix(lesson, text)
+      const a = await store.addExtra(chapter.id, 'fixed', '', fixed, model)
+      const b = await store.addExtra(chapter.id, 'check', '', { ...check, verdict: 'fixed', checkedAt: new Date().toISOString() }, model)
+      setExtras((e) => ({ ...e, [chapter.id]: [...(e[chapter.id] ?? []), a, b] }))
+      return fixed
+    },
+    [store, settings],
+  )
+
   const fixChapter = useCallback(
     (chapter: TreeNode, lesson: Lesson, check: CheckResult) =>
       run(liveKey(chapter.id, 'fix', ''), async () => {
-        if (!store) return
         const trail = chainIds(chapter.id, known).slice(0, 3).map((x) => known[x]?.title ?? '').filter(Boolean)
-        const issues = check.issues
-          .map((i, n) => `${n + 1}. Claim: ${i.claim}\n   Problem: ${i.problem}\n   Correction: ${i.correction}`)
-          .join('\n')
-        const { text, model } = await generate(
-          { kind: 'fix', trail: trail.length ? trail : [chapter.title], context: lessonBlocks(lesson), issues },
-          settings,
-        )
-        const fixed = applyFix(lesson, text)
-        const a = await store.addExtra(chapter.id, 'fixed', '', fixed, model)
-        const b = await store.addExtra(chapter.id, 'check', '', { ...check, verdict: 'fixed', checkedAt: new Date().toISOString() }, model)
-        setExtras((e) => ({ ...e, [chapter.id]: [...(e[chapter.id] ?? []), a, b] }))
+        await fixLesson(chapter, trail, lesson, check)
       }),
-    [run, store, settings, known],
+    [run, known, fixLesson],
   )
 
   /**
    * Write a spoken script, record it in the teacher's voice, store the MP3. Runs in the
    * background (progress in the floating pill), so reading isn't interrupted.
    */
+  const makeLecture = useCallback(
+    async (
+      chapter: TreeNode,
+      have: Record<string, TreeNode>,
+      lesson: Lesson,
+      sections: string[],
+      length: LectureLength,
+      which: 0 | 1,
+      setJob: (status: string) => void,
+    ): Promise<Extra> => {
+      if (!store) throw new Error('Still loading. Try again.')
+      const tv = which === 1 && teacher.second ? teacher.second : teacher
+      const key = `${Date.now()}${Math.random().toString(36).slice(2, 6)}`
+      const label = sections.join(' + ') || 'Whole chapter'
+      setJob('Writing script…')
+      const chain = chainIds(chapter.id, have).map((x) => have[x]).filter(Boolean)
+      const trail = chain.slice(0, 3).map((n) => n.title)
+      const { text, model } = await generate(
+        {
+          kind: 'lecture',
+          trail: trail.length ? trail : [chapter.title],
+          chapter: { title: chapter.title, summary: chapter.summary, index: 0, outline: [] },
+          context: lessonText(lesson),
+          focus: sections.length ? sections : undefined,
+          length,
+        },
+        settings,
+      )
+      const script = text.trim()
+      const v = await resolveVoice(tv.voice, tv.model, settings)
+      const audio = await record(script, { voice: v.voice, style: tv.style, model: v.model }, settings, (d, n) => setJob(`Recording ${d}/${n}…`))
+      setJob('Saving…')
+      const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40)
+      const ext = audio.type === 'audio/wav' ? 'wav' : 'mp3'
+      const audioUrl = await store.uploadAudio(`${chapter.id}/${slug}-${key}.${ext}`, audio)
+      const code = chain[2]?.meta.code
+      const body: LectureBody = {
+        script,
+        audioUrl,
+        voice: v.voice,
+        style: tv.style,
+        sections,
+        length,
+        fileName: `${[code, chapter.title, sections.length ? label : '', length].filter(Boolean).join(' - ').replace(/[\\/:*?"<>|]+/g, '')}.${ext}`,
+      }
+      const row = await store.addExtra(chapter.id, 'lecture', key, body, model)
+      setExtras((e) => ({ ...e, [chapter.id]: [...(e[chapter.id] ?? []), row] }))
+      setLectures((ls) => [...ls, row])
+      return row
+    },
+    [store, settings, teacher],
+  )
+
   const runLecture = useCallback(
-    (chapter: TreeNode, lesson: Lesson, sections: string[], length: LectureLength) => {
-      const key = String(Date.now())
-      const id = liveKey(chapter.id, 'lecture', key)
+    (chapter: TreeNode, lesson: Lesson, sections: string[], length: LectureLength, which: 0 | 1 = 0) => {
+      const id = liveKey(chapter.id, 'lecture', String(Date.now()))
       const label = sections.join(' + ') || 'Whole chapter'
       const setJob = (status: string) => setJobs((j) => ({ ...j, [id]: { chapterId: chapter.id, label, status } }))
       setJob('Writing script…')
       return run(id, async () => {
-        if (!store) return
         try {
-          const chain = chainIds(chapter.id, known).map((x) => known[x]).filter(Boolean)
-          const trail = chain.slice(0, 3).map((n) => n.title)
-          const { text, model } = await generate(
-            {
-              kind: 'lecture',
-              trail: trail.length ? trail : [chapter.title],
-              chapter: { title: chapter.title, summary: chapter.summary, index: 0, outline: [] },
-              context: lessonText(lesson),
-              focus: sections.length ? sections : undefined,
-              length,
-            },
-            settings,
-          )
-          const script = text.trim()
-          const v = await resolveVoice(teacher.voice, teacher.model, settings)
-          const audio = await record(script, { voice: v.voice, style: teacher.style, model: v.model }, settings, (d, n) =>
-            setJob(`Recording ${d}/${n}…`),
-          )
-          setJob('Saving…')
-          const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40)
-          const ext = audio.type === 'audio/wav' ? 'wav' : 'mp3'
-          const audioUrl = await store.uploadAudio(`${chapter.id}/${slug}-${key}.${ext}`, audio)
-          const code = chain[2]?.meta.code
-          const body: LectureBody = {
-            script,
-            audioUrl,
-            voice: v.voice,
-            style: teacher.style,
-            sections,
-            length,
-            fileName: `${[code, chapter.title, sections.length ? label : '', length].filter(Boolean).join(' - ').replace(/[\\/:*?"<>|]+/g, '')}.${ext}`,
-          }
-          const row = await store.addExtra(chapter.id, 'lecture', key, body, model)
-          setExtras((e) => ({ ...e, [chapter.id]: [...(e[chapter.id] ?? []), row] }))
-          setLectures((ls) => [...ls, row])
+          await makeLecture(chapter, known, lesson, sections, length, which, setJob)
           setJob('ready')
         } catch (err) {
           setJob(`failed: ${err instanceof Error ? err.message : 'Something went wrong.'}`)
@@ -428,7 +492,118 @@ export default function App() {
         }
       })
     },
-    [run, store, settings, known, teacher],
+    [run, known, makeLecture],
+  )
+
+  /** Every chapter of a path in order; a course step brings all its chapters (laid out if new). */
+  const pathChapters = useCallback(
+    async (p: Path): Promise<BatchItem[]> => {
+      if (!store) return []
+      const have = await loadAncestors(p.steps.map((s) => s.node_id))
+      const sub = (n: TreeNode) => {
+        const course = chainIds(n.id, have).map((x) => have[x]).find((x) => x?.level === 'course')
+        return course ? [course.meta.code, course.title].filter(Boolean).join(' · ') : ''
+      }
+      const out: TreeNode[] = []
+      const found: Record<string, TreeNode> = {}
+      for (const s of p.steps) {
+        const n = have[s.node_id]
+        if (!n) continue
+        if (n.level === 'chapter') out.push(n)
+        else if (n.level === 'course') {
+          const trail = chainIds(n.id, have).map((x) => have[x]?.title ?? '').filter(Boolean)
+          const { list } = await childrenOrGenerate(store, settings, n, trail)
+          for (const c of list) found[c.id] = c
+          out.push(...list)
+        }
+      }
+      setExtra((e) => ({ ...e, ...found }))
+      Object.assign(have, found)
+      return out
+        .filter((n, i) => out.findIndex((x) => x.id === n.id) === i)
+        .map((n) => ({ id: n.id, title: n.title, sub: sub(n), length: 'medium', status: '' }))
+    },
+    [store, settings, loadAncestors],
+  )
+
+  /**
+   * Make a path's chapters in the background, two at a time: write each (if new), fact-check
+   * and fix to the chosen level, then record a whole-chapter lecture. Anything already done
+   * is skipped, so running it again picks up where it stopped.
+   */
+  const runBatch = useCallback(
+    async (pathId: string, items: BatchItem[], opts: BatchOptions) => {
+      if (!store || batchRef.current?.running) return
+      const fresh = (b: Batch | null) => (b && b.pathId === pathId ? b : null)
+      setBatch({ pathId, running: true, stopping: false, items: items.map((i) => ({ ...i, status: 'Waiting' })) })
+      stopBatch.current = false
+      const set = (id: string, patch: Partial<BatchItem>) =>
+        setBatch((b) => fresh(b) && { ...b!, items: b!.items.map((x) => (x.id === id ? { ...x, ...patch } : x)) })
+      let lock: WakeLockSentinel | null = null
+      try {
+        lock = await navigator.wakeLock?.request('screen')
+      } catch {
+        /* not supported or refused: the screen may sleep and pause the batch */
+      }
+      const have = await loadAncestors(items.map((i) => i.id))
+      const one = async (it: BatchItem) => {
+        const status = (s: string) => set(it.id, { status: s })
+        const node = have[it.id]
+        if (!node) throw new Error('Chapter not found.')
+        const trail = chainIds(it.id, have).slice(0, 3).map((x) => have[x]?.title ?? '').filter(Boolean)
+        status('Writing…')
+        let lesson = await writeLesson(node, trail, [])
+        setDocs((d) => ({ ...d, [node.id]: lesson }))
+        const ex = await store.extras(node.id).catch(() => [] as Extra[])
+        setExtras((e) => ({ ...e, [node.id]: ex }))
+        lesson = (latest(ex, 'fixed')?.body as Lesson | undefined) ?? lesson
+        if (opts.level !== 'fast') {
+          let check = latest(ex, 'check')?.body as CheckResult | undefined
+          if (!check) {
+            status('Fact-checking…')
+            check = await checkLesson(node, trail, lesson)
+          }
+          if (opts.level === 'thorough' && check.verdict === 'issues' && check.issues.length) {
+            status(`Fixing ${check.issues.length} issue${check.issues.length === 1 ? '' : 's'}…`)
+            lesson = await fixLesson(node, trail, lesson, check)
+          }
+        }
+        if (!opts.record) return true
+        if (stopBatch.current) return false
+        const old = opts.redo
+          ? undefined
+          : [...ex].reverse().find((x) => {
+              const b = x.body as LectureBody
+              return x.kind === 'lecture' && !lectureSections(b).length && (b.length ?? 'medium') === it.length
+            })
+        const row = old ?? (await makeLecture(node, have, lesson, [], it.length, opts.voice, status))
+        set(it.id, { lectureId: row.id })
+        return true
+      }
+      let next = 0
+      const worker = async () => {
+        while (!stopBatch.current && next < items.length) {
+          const it = items[next++]
+          try {
+            set(it.id, { status: (await one(it)) ? '✓ Done' : 'Stopped' })
+          } catch (err) {
+            set(it.id, { status: `failed: ${err instanceof Error ? err.message : 'Something went wrong.'}` })
+          }
+        }
+      }
+      await Promise.all([worker(), worker()])
+      void lock?.release().catch(() => {})
+      setBatch(
+        (b) =>
+          fresh(b) && {
+            ...b!,
+            running: false,
+            stopping: false,
+            items: b!.items.map((x) => (x.status === 'Waiting' ? { ...x, status: 'Stopped' } : x)),
+          },
+      )
+    },
+    [store, loadAncestors, writeLesson, checkLesson, fixLesson, makeLecture],
   )
 
   const removeExtra = async (chapter: TreeNode, x: Extra) => {
@@ -836,7 +1011,7 @@ export default function App() {
               .map((k) => k.slice(prefix.length))
           },
           run: (kind, key, req) => void runExtra(chapter, kind, key, { ...req, context: lessonText(lesson) }),
-          lecture: (sections, length) => void runLecture(chapter, lesson, sections, length),
+          lecture: (sections, length, voice) => void runLecture(chapter, lesson, sections, length, voice),
           jobs: Object.entries(jobs)
             .filter(([, j]) => j.chapterId === chapter.id && j.status !== 'ready')
             .map(([id, j]) => ({ id, ...j })),
@@ -1097,6 +1272,7 @@ export default function App() {
             onMeta={saveMeta}
             outlook={plan.outlook}
             panelWidth={panelWidth}
+            onLectures={setBatchSheet}
           />
         )}
 
@@ -1228,7 +1404,27 @@ export default function App() {
           </div>
         </main>
 
+        {store && batchSheet && paths.find((x) => x.id === batchSheet) && (
+          <PathLectures
+            path={paths.find((x) => x.id === batchSheet)!}
+            store={store}
+            teacher={teacher}
+            batch={batch?.pathId === batchSheet ? batch : null}
+            busyElsewhere={!!batch?.running && batch.pathId !== batchSheet}
+            loadChapters={pathChapters}
+            onStart={(items, opts) => void runBatch(batchSheet, items, opts)}
+            onStop={() => {
+              stopBatch.current = true
+              setBatch((b) => b && { ...b, stopping: true })
+            }}
+            onClose={() => setBatchSheet('')}
+          />
+        )}
+
         <JobPill
+          batch={batch && !batchSheet ? { ...batch, title: paths.find((x) => x.id === batch.pathId)?.title ?? 'Path' } : null}
+          onOpenBatch={() => batch && setBatchSheet(batch.pathId)}
+          onDismissBatch={() => setBatch((b) => (b?.running ? b : null))}
           jobs={jobs}
           names={known}
           onOpen={(id, chapterId) => {
@@ -1296,20 +1492,50 @@ function useWidth() {
 
 /** Floating status for lectures recording in the background. */
 function JobPill({
+  batch,
+  onOpenBatch,
+  onDismissBatch,
   jobs,
   names,
   onOpen,
   onDismiss,
 }: {
+  batch: (Batch & { title: string }) | null
+  onOpenBatch: () => void
+  onDismissBatch: () => void
   jobs: Record<string, { chapterId: string; label: string; status: string }>
   names: Record<string, TreeNode>
   onOpen: (id: string, chapterId: string) => void
   onDismiss: (id: string) => void
 }) {
   const list = Object.entries(jobs)
-  if (!list.length) return null
+  if (!list.length && !batch) return null
+  const done = batch?.items.filter((i) => i.status === '✓ Done').length ?? 0
+  const failed = batch?.items.filter((i) => i.status.startsWith('failed')).length ?? 0
+  const now = batch?.items.find((i) => i.status && !['Waiting', '✓ Done', 'Stopped'].includes(i.status) && !i.status.startsWith('failed'))
   return (
     <div className="job-pills" aria-live="polite">
+      {batch && (
+        <div className={`job-pill ${!batch.running && !failed ? 'ready' : ''} ${!batch.running && failed ? 'failed' : ''}`}>
+          <button className="job-main" onClick={onOpenBatch}>
+            {batch.running && <span className="pulse" />}
+            <span className="job-text">
+              <b>
+                🎧 {batch.title}: {done}/{batch.items.length}
+                {batch.running ? '' : ' done'}
+              </b>
+              <small>
+                {batch.running ? (now ? `${now.title} · ${now.status}` : 'Starting…') : failed ? `${failed} failed · tap to retry` : 'Tap to play or queue them'}
+              </small>
+            </span>
+          </button>
+          {!batch.running && (
+            <button className="job-x" onClick={onDismissBatch} aria-label="Dismiss">
+              ×
+            </button>
+          )}
+        </div>
+      )}
       {list.map(([id, j]) => {
         const ready = j.status === 'ready'
         const failed = j.status.startsWith('failed')
