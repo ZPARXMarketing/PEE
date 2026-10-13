@@ -30,7 +30,8 @@ export interface ToolCtx {
   /** delete one saved extra (a chart) */
   remove: (x: Extra) => void
   /** record a lecture covering these sections (none = whole chapter) */
-  lecture: (sections: string[], length: LectureLength) => void
+  /** voice: 0 = voice 1, 1 = voice 2 */
+  lecture: (sections: string[], length: LectureLength, voice: 0 | 1) => void
   /** lectures recording right now for this chapter */
   jobs: { id: string; label: string; status: string }[]
   teacher: Teacher
@@ -405,7 +406,9 @@ export function LectureSheet({
   const [started, setStarted] = useState(false)
   const counts = lectureCounts(ctx.extras)
   const mine = ctx.extras.filter((x) => x.kind === 'lecture').reverse()
-  const voice = voiceLabel(ctx.teacher.voice)
+  const second = ctx.teacher.second
+  const [which, setWhich] = useState<0 | 1>(0)
+  const voice = voiceLabel(which === 1 && second ? second.voice : ctx.teacher.voice)
   const canRecord = whole || picked.size > 0
 
   const toggle = (h: string) => {
@@ -458,11 +461,21 @@ export function LectureSheet({
             </button>
           ))}
         </div>
+        {second && (
+          <div className="seg two" role="radiogroup" aria-label="Voice">
+            {[ctx.teacher.voice, second.voice].map((v, i) => (
+              <button key={i} role="radio" aria-checked={which === i} className={which === i ? 'on' : ''} onClick={() => setWhich(i as 0 | 1)}>
+                Voice {i + 1}
+                <small>{voiceLabel(v)}</small>
+              </button>
+            ))}
+          </div>
+        )}
         <button
           className="btn-neon record-btn"
           disabled={!canRecord}
           onClick={() => {
-            ctx.lecture(whole ? [] : headings.filter((h) => picked.has(h)), length)
+            ctx.lecture(whole ? [] : headings.filter((h) => picked.has(h)), length, second ? which : 0)
             setStarted(true)
             setPicked(new Set())
             setWhole(false)
@@ -538,6 +551,7 @@ export function LectureControl({ id, url, title, subtitle, fileName }: Track) {
   const audio = useAudio()
   const p = audio.progress(id)
   const isCurrent = audio.current?.id === id
+  const queued = audio.queue.some((t) => t.id === id)
   const pos = isCurrent ? audio.position : (p?.pos ?? 0)
   const dur = isCurrent ? audio.duration : (p?.dur ?? 0)
   const pct = p?.done && !isCurrent ? 100 : dur ? Math.min(100, (pos / dur) * 100) : 0
@@ -555,6 +569,15 @@ export function LectureControl({ id, url, title, subtitle, fileName }: Track) {
         <span className={`lect-status ${p?.done ? 'done' : ''}`}>
           {p?.done ? '✓ Listened' : dur ? `${clock(pos)} / ${clock(dur)}` : 'New'}
         </span>
+        {!isCurrent && (
+          <button
+            className={`lect-queue ${queued ? 'on' : ''}`}
+            onClick={() => (queued ? audio.dequeue(id) : audio.enqueue([{ id, url, title, subtitle, fileName }]))}
+            aria-label={queued ? 'Remove from queue' : 'Add to queue'}
+          >
+            {queued ? '✓ Queued' : '+ Queue'}
+          </button>
+        )}
         <a className="download" href={download} download={fileName}>
           ⬇
         </a>

@@ -4,6 +4,7 @@ import type { Store } from './store.ts'
 
 const SPEEDS = [0.75, 1, 1.25, 1.5, 2]
 const PREF = 'listening'
+const QUEUE = 'queue'
 
 /**
  * Owns the one <audio> element for the whole app, so a lecture keeps playing when its
@@ -23,6 +24,11 @@ export function AudioProvider({ store, speed, children }: { store: Store | null;
   listenRef.current = listen
   const lastSave = useRef(0)
   const resumeAt = useRef(0)
+  const [queue, setQueue] = useState<Track[]>([])
+  const queueRef = useRef(queue)
+  queueRef.current = queue
+  /** the synced queue has loaded, so changes can be saved without wiping it */
+  const queueLoaded = useRef(false)
 
   useEffect(() => setRateState(speed), [speed])
 
@@ -32,7 +38,18 @@ export function AudioProvider({ store, speed, children }: { store: Store | null;
       .pref<Record<string, Progress>>(PREF)
       .then((p) => p && setListen((cur) => ({ ...p, ...cur })))
       .catch(() => {})
+    void store
+      .pref<Track[]>(QUEUE)
+      .then((q) => {
+        if (Array.isArray(q)) setQueue((cur) => [...cur, ...q.filter((t) => !cur.some((c) => c.id === t.id))])
+      })
+      .catch(() => {})
+      .finally(() => (queueLoaded.current = true))
   }, [store])
+
+  useEffect(() => {
+    if (store && queueLoaded.current) void store.setPref(QUEUE, queue).catch(() => {})
+  }, [store, queue])
 
   const persist = useCallback(
     (force = false) => {
@@ -77,6 +94,7 @@ export function AudioProvider({ store, speed, children }: { store: Store | null;
     (t: Track) => {
       const a = el.current
       if (!a) return
+      setQueue((q) => (q.some((x) => x.id === t.id) ? q.filter((x) => x.id !== t.id) : q))
       if (current?.id === t.id) {
         void a.play()
         return
@@ -97,6 +115,13 @@ export function AudioProvider({ store, speed, children }: { store: Store | null;
     [current, mark, persist, rate],
   )
 
+  const next = useCallback(() => {
+    const t = queueRef.current[0]
+    if (t) play(t)
+  }, [play])
+  const nextRef = useRef(next)
+  nextRef.current = next
+
   // lock screen / headphones
   useEffect(() => {
     if (!('mediaSession' in navigator) || !current) return
@@ -115,7 +140,8 @@ export function AudioProvider({ store, speed, children }: { store: Store | null;
     set('seekbackward', () => a && (a.currentTime = Math.max(0, a.currentTime - 15)))
     set('seekforward', () => a && (a.currentTime = Math.min(a.duration || 0, a.currentTime + 15)))
     set('seekto', (d) => a && d.seekTime !== undefined && (a.currentTime = d.seekTime))
-  }, [current])
+    set('nexttrack', queue.length ? () => nextRef.current() : null)
+  }, [current, queue.length])
 
   const api: AudioApi = useMemo(
     () => ({
@@ -150,8 +176,29 @@ export function AudioProvider({ store, speed, children }: { store: Store | null;
         setCurrent(null)
       },
       progress: (id) => listen[id],
+      queue,
+      enqueue: (tracks) =>
+        setQueue((q) => [...q, ...tracks.filter((t, i) => t.id !== current?.id && !q.some((x) => x.id === t.id) && tracks.findIndex((y) => y.id === t.id) === i)]),
+      playAll: (tracks) => {
+        if (!tracks.length) return
+        const ids = new Set(tracks.map((t) => t.id))
+        setQueue((q) => [...tracks.slice(1), ...q.filter((x) => !ids.has(x.id))])
+        play(tracks[0])
+      },
+      dequeue: (id) => setQueue((q) => q.filter((x) => x.id !== id)),
+      moveQueued: (id, by) =>
+        setQueue((q) => {
+          const i = q.findIndex((x) => x.id === id)
+          const j = i + by
+          if (i < 0 || j < 0 || j >= q.length) return q
+          const n = [...q]
+          ;[n[i], n[j]] = [n[j], n[i]]
+          return n
+        }),
+      clearQueue: () => setQueue([]),
+      next,
     }),
-    [current, playing, position, duration, rate, play, mark, persist, listen],
+    [current, playing, position, duration, rate, play, mark, persist, listen, queue, next],
   )
 
   return (
@@ -182,20 +229,46 @@ export function AudioProvider({ store, speed, children }: { store: Store | null;
           setPlaying(false)
           mark(true)
           persist(true)
+          nextRef.current()
         }}
       />
-      {current && <Bar api={api} />}
+      {(current || queue.length > 0) && <Bar api={api} />}
     </AudioCtx.Provider>
   )
 }
 
 /** The bar pinned to the bottom of the screen while a lecture is loaded. */
 function Bar({ api }: { api: AudioApi }) {
-  const { current, playing, position, duration, rate } = api
-  if (!current) return null
+  const { current, playing, position, duration, rate, queue } = api
+  const [showQueue, setShowQueue] = useState(false)
   const next = SPEEDS[(SPEEDS.indexOf(rate) + 1) % SPEEDS.length] ?? 1
+  const queueBtn = (
+    <button className={`mp-queue ${showQueue ? 'on' : ''}`} onClick={() => setShowQueue((v) => !v)} aria-expanded={showQueue} aria-label="Up next">
+      ☰ {queue.length}
+    </button>
+  )
+  const list = showQueue && <QueueList api={api} onClose={() => setShowQueue(false)} />
+  if (!current)
+    return (
+      <div className="mini-player idle" role="region" aria-label="Lecture queue">
+        {list}
+        <div className="mp-info">
+          <div className="mp-title">🎧 {queue.length} queued</div>
+          <div className="mp-sub">Next: {queue[0]?.title}</div>
+        </div>
+        <div className="mp-controls">
+          {queueBtn}
+          <button className="mp-play" onClick={api.next} aria-label="Play the queue">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+              <path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z" fill="currentColor" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    )
   return (
     <div className="mini-player" role="region" aria-label="Lecture player">
+      {list}
       <div className="mp-info">
         <div className="mp-title">🎧 {current.title}</div>
         <div className="mp-sub">{current.subtitle}</div>
@@ -222,6 +295,7 @@ function Bar({ api }: { api: AudioApi }) {
         <button className="mp-speed" onClick={() => api.setRate(next)} aria-label={`Speed ${rate}×, tap for ${next}×`}>
           {rate}×
         </button>
+        {queueBtn}
       </div>
       <div className="mp-seek">
         <span>{clock(position)}</span>
@@ -239,6 +313,46 @@ function Bar({ api }: { api: AudioApi }) {
       <button className="mp-close" onClick={api.close} aria-label="Close player">
         ×
       </button>
+    </div>
+  )
+}
+
+/** Up next: reorder, remove, skip to one, clear. */
+function QueueList({ api, onClose }: { api: AudioApi; onClose: () => void }) {
+  const { queue } = api
+  return (
+    <div className="mp-queue-list" role="dialog" aria-label="Up next">
+      <div className="mpq-head">
+        <b>Up next ({queue.length})</b>
+        {queue.length > 0 && (
+          <button className="reveal" onClick={() => confirm('Clear the whole queue?') && api.clearQueue()}>
+            Clear
+          </button>
+        )}
+        <button className="mpq-x" onClick={onClose} aria-label="Close queue">
+          ×
+        </button>
+      </div>
+      {!queue.length && <p className="sheet-note">Nothing queued. Tap + Queue on any lecture, or queue a whole path.</p>}
+      <ol>
+        {queue.map((t, i) => (
+          <li key={t.id}>
+            <button className="mpq-play" onClick={() => api.play(t)} title="Play now">
+              <span className="mpq-title">{t.title}</span>
+              <span className="mpq-sub">{t.subtitle}</span>
+            </button>
+            <button onClick={() => api.moveQueued(t.id, -1)} disabled={i === 0} aria-label="Move up">
+              ↑
+            </button>
+            <button onClick={() => api.moveQueued(t.id, 1)} disabled={i === queue.length - 1} aria-label="Move down">
+              ↓
+            </button>
+            <button onClick={() => api.dequeue(t.id)} aria-label="Remove from queue">
+              ×
+            </button>
+          </li>
+        ))}
+      </ol>
     </div>
   )
 }

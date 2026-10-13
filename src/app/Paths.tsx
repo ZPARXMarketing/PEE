@@ -37,6 +37,8 @@ interface Props {
   onMeta: (id: string, fields: { timing?: Timing; pressing?: boolean; shelved?: boolean }) => void
   outlook: PathOutlook[]
   panelWidth: PanelWidth
+  /** open the path-lectures sheet (write, check, record, queue the whole path) */
+  onLectures?: (pathId: string) => void
 }
 
 export type Filter = 'all' | PathStatus
@@ -246,6 +248,11 @@ function PathPanel(p: Props & { path: Path }) {
               📅 Schedule this path
             </button>
             {!path.steps.length && <span className="muted">Add chapters first.</span>}
+            {!!path.steps.length && p.onLectures && (
+              <button className="btn-ghost" onClick={() => p.onLectures!(path.id)}>
+                🎧 Lectures
+              </button>
+            )}
           </div>
         ) : (
           <div className="path-sched">
@@ -276,6 +283,11 @@ function PathPanel(p: Props & { path: Path }) {
                         : 'All done.'}
             </p>
             {timing === 'date' && !path.due && <p className="path-outlook late">Pick the due date.</p>}
+            {p.onLectures && (
+              <button className="btn-ghost" onClick={() => p.onLectures!(path.id)}>
+                🎧 Lectures for this path
+              </button>
+            )}
           </div>
         )}
         <div className="path-meta">

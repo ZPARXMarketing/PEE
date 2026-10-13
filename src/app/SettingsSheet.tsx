@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { looksLikeKey, speak, speechModels, type Settings } from './generate.ts'
-import { DEFAULT_MODEL, DEFAULT_VOICE, SPEECH_MODEL, STYLES, sortVoices, voiceLabel, type SpeechModel } from './prompts.ts'
-import type { Bucket, Teacher } from './types.ts'
+import { looksLikeKey, pcmToWav, speak, speechModels, type Settings } from './generate.ts'
+import { DEFAULT_MODEL, DEFAULT_VOICE, SPEECH_MODEL, STYLES, costLabel, sortVoices, takesStyle, voiceLabel, type SpeechModel } from './prompts.ts'
+import type { Bucket, Teacher, TeacherVoice } from './types.ts'
 import { InstallButton } from './InstallButton.tsx'
 import { TextSizeSetting } from './TextSize.tsx'
 
@@ -20,6 +20,9 @@ interface Props {
 
 const PALETTE = ['#ff9f43', '#c9a7ff', '#7ee081', '#ff5c7a', '#f7f06d', '#5ad1c4', '#ffffff']
 
+/** 20 ms of silent WAV, played inside the tap to unlock audio on Safari */
+const SILENCE =
+  'data:audio/wav;base64,UklGRsQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
 const SAMPLE = "Hi, I'm your teacher for this course. Let's start with the one idea that makes everything else in this chapter click."
 
 export function SettingsSheet({
@@ -52,32 +55,50 @@ export function SettingsSheet({
       })
       .catch(() => {})
   }, [settings])
-  const model = t.model || defaultModel
+  /** which voice the pickers edit: 0 = voice 1, 1 = voice 2 (starts as a copy of voice 1) */
+  const [slot, setSlot] = useState<0 | 1>(0)
+  const v: TeacherVoice = slot === 1 ? (t.second ?? { voice: t.voice, style: t.style, model: t.model }) : t
+  const setV = (patch: Partial<TeacherVoice>) =>
+    setT((cur) =>
+      slot === 1
+        ? { ...cur, second: { ...(cur.second ?? { voice: cur.voice, style: cur.style, model: cur.model }), ...patch } }
+        : { ...cur, ...patch },
+    )
+  const model = v.model || defaultModel
   const live = useMemo(() => sortVoices(models.find((m) => m.id === model)?.voices ?? []), [models, model])
-  const voices = live.length ? live : [t.voice || DEFAULT_VOICE]
-  /** only OpenAI voice models take a speaking-style instruction */
-  const styled = model.startsWith('openai/')
+  const voices = live.length ? live : [v.voice || DEFAULT_VOICE]
+  const styled = takesStyle(model)
   // a saved voice the current model doesn't offer would fail; pick the first one it does
   useEffect(() => {
-    if (live.length && !live.includes(t.voice)) setT((cur) => ({ ...cur, voice: live[0] }))
-  }, [live, t.voice])
+    if (live.length && !live.includes(v.voice)) setV({ voice: live[0] })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [live, v.voice])
 
   const preview = async () => {
-    const k = `${model}:${t.voice}:${t.style}`
+    const k = `${model}:${v.voice}:${v.style}`
     setPreviewErr('')
+    // Safari only lets audio start inside the tap; a slow voice model outlasts it. Start one
+    // element playing silence now, then hand it the sample once it arrives.
+    audio.current?.pause()
+    const el = (audio.current ??= new Audio())
+    el.src = SILENCE
+    void el.play().catch(() => {})
     try {
       let url = samples.current.get(k)
       if (!url) {
         setPreviewing(true)
-        url = URL.createObjectURL(await speak({ text: SAMPLE, voice: t.voice, style: t.style, model: t.model }, draft))
+        const clip = await speak({ text: SAMPLE, voice: v.voice, style: v.style, model }, draft)
+        // raw PCM (Gemini) won't play on its own; wrap it as WAV
+        url = URL.createObjectURL(/pcm|l16/i.test(clip.type) ? await pcmToWav([clip]) : clip)
         samples.current.set(k, url)
       }
-      audio.current?.pause()
-      audio.current = new Audio(url)
-      audio.current.playbackRate = t.speed
-      await audio.current.play()
+      el.src = url
+      el.playbackRate = t.speed
+      await el.play()
     } catch (e) {
-      setPreviewErr(e instanceof Error ? e.message : 'Preview failed.')
+      // the sample is cached, so a second tap plays it straight away
+      if (e instanceof DOMException && e.name === 'NotAllowedError') setPreviewErr('Voice ready. Tap Preview again to play it.')
+      else setPreviewErr(e instanceof Error ? e.message : 'Preview failed.')
     } finally {
       setPreviewing(false)
     }
@@ -190,14 +211,23 @@ export function SettingsSheet({
           )}
         </div>
 
-        <h3 className="sheet-sub">Teacher voice</h3>
+        <h3 className="sheet-sub">Teacher voices</h3>
+        <div className="seg two" role="radiogroup" aria-label="Which voice">
+          {(['Voice 1', 'Voice 2'] as const).map((label, i) => (
+            <button key={label} type="button" role="radio" aria-checked={slot === i} className={slot === i ? 'on' : ''} onClick={() => setSlot(i as 0 | 1)}>
+              {label}
+              <small>{i === 0 ? voiceLabel(t.voice) : t.second ? voiceLabel(t.second.voice) : 'not set'}</small>
+            </button>
+          ))}
+        </div>
         {models.length > 1 && (
           <label>
             Voice model
-            <select value={model} onChange={(e) => setT({ ...t, model: e.target.value === defaultModel ? undefined : e.target.value })}>
+            <select value={model} onChange={(e) => setV({ model: e.target.value === defaultModel ? undefined : e.target.value })}>
               {models.map((m) => (
                 <option key={m.id} value={m.id}>
                   {m.name}
+                  {costLabel(m) && ` · ${costLabel(m)}`}
                 </option>
               ))}
             </select>
@@ -206,7 +236,7 @@ export function SettingsSheet({
         <div className="sheet-grid">
           <label>
             Voice
-            <select value={t.voice} onChange={(e) => setT({ ...t, voice: e.target.value })}>
+            <select value={v.voice} onChange={(e) => setV({ voice: e.target.value })}>
               {voices.map((v) => (
                 <option key={v} value={v}>
                   {voiceLabel(v)}
@@ -216,7 +246,7 @@ export function SettingsSheet({
           </label>
           <label hidden={!styled}>
             Style
-            <select value={t.style} onChange={(e) => setT({ ...t, style: e.target.value })}>
+            <select value={v.style} onChange={(e) => setV({ style: e.target.value })}>
               {Object.entries(STYLES).map(([k, s]) => (
                 <option key={k} value={k}>
                   {s.label}
@@ -238,6 +268,18 @@ export function SettingsSheet({
         <button type="button" className="btn-ghost preview-btn" onClick={() => void preview()} disabled={previewing}>
           {previewing ? 'Loading…' : '▶ Preview voice'}
         </button>
+        {slot === 1 && t.second && (
+          <button
+            type="button"
+            className="btn-ghost"
+            onClick={() => {
+              setT(({ second: _, ...rest }) => rest)
+              setSlot(0)
+            }}
+          >
+            Remove voice 2
+          </button>
+        )}
         {previewErr && <p className="error">{previewErr}</p>}
         <p className="sheet-note">Synced to all your devices. Applies to new lectures; existing ones keep their voice.</p>
 

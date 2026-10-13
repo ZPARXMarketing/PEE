@@ -13,6 +13,30 @@ export const FACTCHECK_MODEL = 'perplexity/sonar'
 /** drafts Paths: reads pasted text, photos and PDFs of the assignment */
 export const PATH_MODEL = 'google/gemini-3.8-flash'
 
+/**
+ * POST to OpenRouter's chat completions, retrying a 429 (rate limit) up to 3 times.
+ * Waits Retry-After when given (capped at 5s, so the edge function still answers well inside
+ * Netlify's 40s first-byte limit), otherwise 1s, 2s, 4s.
+ */
+export async function postCompletion(headers: Record<string, string>, body: unknown): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify(body),
+    })
+    if (res.status !== 429 || attempt >= 3) return res
+    await res.body?.cancel().catch(() => {})
+    const after = Number(res.headers.get('retry-after'))
+    const wait = after > 0 ? Math.min(after * 1000, 5000) : 1000 * 2 ** attempt
+    await new Promise((r) => setTimeout(r, wait))
+  }
+}
+
+/** "OpenRouter returned 429: <OpenRouter's reason>" for a failed completion. */
+export const openRouterError = (status: number, detail: string) =>
+  `OpenRouter returned ${status}${detail ? `: ${detail}` : '.'}`
+
 export type GenKind =
   | 'branches'
   | 'courses'
@@ -519,21 +543,23 @@ export function isSpeechRequest(x: unknown): x is SpeechRequest {
   )
 }
 
-export function speechBody(req: SpeechRequest, model: string, withStyle = true) {
+/** OpenAI and Gemini voice models take a speaking-style instruction */
+export const takesStyle = (model: string) => /^(openai|google)\//.test(model)
+
+export function speechBody(req: SpeechRequest, model: string, withStyle = true, format: 'mp3' | 'pcm' = 'mp3') {
   return {
     model,
     input: req.text,
     voice: req.voice,
-    response_format: 'mp3',
-    ...(withStyle && model.startsWith('openai/')
-      ? { provider: { options: { openai: { instructions: STYLES[req.style].instructions } } } }
-      : {}),
+    response_format: format,
+    ...(withStyle && takesStyle(model) ? { instructions: STYLES[req.style].instructions } : {}),
   }
 }
 
 /**
- * Call OpenRouter's speech endpoint. If it rejects the request (400) with the speaking-style
- * option attached, try once more without it. Returns the audio response, or the error detail.
+ * Call OpenRouter's speech endpoint. Gemini only returns raw PCM, so ask it for that; for
+ * the rest ask for MP3. On a 400, retry without the speaking style, then (non-Gemini) as PCM.
+ * Returns the audio response, or the error detail.
  */
 export async function synthesize(
   apiKey: string,
@@ -542,11 +568,14 @@ export async function synthesize(
   headers: Record<string, string> = {},
 ): Promise<{ ok: true; res: Response } | { ok: false; status: number; detail: string }> {
   let last = { status: 0, detail: '' }
-  for (const withStyle of [true, false]) {
+  const attempts: [boolean, 'mp3' | 'pcm'][] = model.startsWith('google/')
+    ? [[true, 'pcm'], [false, 'pcm']]
+    : [[true, 'mp3'], [false, 'mp3'], [false, 'pcm']]
+  for (const [withStyle, format] of attempts) {
     const res = await fetch(`${OPENROUTER_BASE_URL}/audio/speech`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}`, 'X-Title': 'Expertise Engine', ...headers },
-      body: JSON.stringify(speechBody(req, model, withStyle)),
+      body: JSON.stringify(speechBody(req, model, withStyle, format)),
     })
     if (res.ok && res.body) return { ok: true, res }
     last = { status: res.status, detail: errorDetail(await res.text().catch(() => '')) }
@@ -571,6 +600,33 @@ export interface SpeechModel {
   id: string
   name: string
   voices: string[]
+  /** $ per million characters read, from OpenRouter's listed prices; unset if unknown */
+  perMillion?: number
+  /** true when perMillion is an estimate (token-priced models) */
+  estimated?: boolean
+}
+
+/**
+ * $ per million characters of script. Character-priced models bill input only, so it's exact.
+ * Gemini bills tokens, so estimate: ~250k text tokens in, and ~1.67M audio tokens out
+ * (1M characters ≈ 18.5 hours at ~150 words/min, 25 audio tokens a second).
+ */
+export function costPerMillion(pricing: unknown, tokenizer: unknown): { perMillion?: number; estimated?: boolean } {
+  const p = pricing as { prompt?: string; completion?: string } | undefined
+  const input = Number(p?.prompt ?? NaN)
+  const output = Number(p?.completion ?? NaN)
+  if (!Number.isFinite(input) || !Number.isFinite(output)) return {}
+  if (output === 0) return { perMillion: input * 1e6 }
+  if (tokenizer === 'Gemini') return { perMillion: input * 250_000 + output * 1_666_667, estimated: true }
+  return {}
+}
+
+/** "$15/M chars", "~$15.20/M chars" (estimate), "free", or "" when unknown */
+export function costLabel(m: SpeechModel): string {
+  if (m.perMillion === undefined) return ''
+  if (m.perMillion === 0) return 'free'
+  const n = m.perMillion
+  return `${m.estimated ? '~' : ''}$${Number.isInteger(n) ? n : n.toFixed(2)}/M chars`
 }
 
 /**
@@ -630,8 +686,15 @@ export async function listSpeechModels(apiKey?: string): Promise<SpeechModel[]> 
     return []
   }
   return data
-    .map((m) => ({ id: String(m.id ?? ''), name: String(m.name ?? m.id ?? ''), voices: findVoices(m) }))
+    .map((m) => ({
+      id: String(m.id ?? ''),
+      name: String(m.name ?? m.id ?? ''),
+      voices: findVoices(m),
+      ...costPerMillion(m.pricing, (m.architecture as { tokenizer?: string } | undefined)?.tokenizer),
+    }))
     .filter((m) => m.id)
+    // cheapest first; unknown prices last
+    .sort((a, b) => (a.perMillion ?? Infinity) - (b.perMillion ?? Infinity))
 }
 
 /** Split a script into chunks under the per-request limit, on paragraph/sentence boundaries. */

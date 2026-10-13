@@ -30,6 +30,17 @@ export interface AudioApi {
   setRate: (r: number) => void
   close: () => void
   progress: (id: string) => Progress | undefined
+  /** up next, in order (synced); the next one starts when the current lecture ends */
+  queue: Track[]
+  /** add to the end of the queue (already-queued ones are skipped) */
+  enqueue: (tracks: Track[]) => void
+  /** play the first now and queue the rest in their place */
+  playAll: (tracks: Track[]) => void
+  dequeue: (id: string) => void
+  moveQueued: (id: string, by: -1 | 1) => void
+  clearQueue: () => void
+  /** start the next queued lecture */
+  next: () => void
 }
 
 export const AudioCtx = createContext<AudioApi | null>(null)

@@ -111,13 +111,18 @@ export interface Extra {
 /** busy / streaming key for one study tool on one chapter */
 export const liveKey = (chapterId: string, kind: string, key: string) => `${chapterId}:${kind}:${key}`
 
-export interface Teacher {
+export interface TeacherVoice {
   voice: string
   style: string
   /** TTS model slug; unset = site default */
   model?: string
+}
+
+export interface Teacher extends TeacherVoice {
   /** playback speed */
   speed: number
+  /** optional second voice, picked per lecture when recording */
+  second?: TeacherVoice
 }
 
 export type LectureLength = 'short' | 'medium' | 'long'
@@ -213,4 +218,37 @@ export interface Availability {
   overrides: DayOverride[]
   /** what the learner typed last time, so they can edit it */
   text: string
+}
+
+/* ---------------- Path lectures (batch) ---------------- */
+
+/** fast = write only; checked = fact-check each chapter; thorough = fact-check, then fix flagged errors */
+export type Thoroughness = 'fast' | 'checked' | 'thorough'
+
+/** One chapter in a path batch. `status` is shown as is; "failed: …" marks a failure. */
+export interface BatchItem {
+  id: string
+  title: string
+  /** course code and title */
+  sub: string
+  length: LectureLength
+  status: string
+  /** the chapter's lecture once recorded (or found) */
+  lectureId?: string
+}
+
+export interface BatchOptions {
+  level: Thoroughness
+  /** record lectures (off = write and check only) */
+  record: boolean
+  voice: 0 | 1
+  /** record again even when a lecture of that length exists */
+  redo: boolean
+}
+
+export interface Batch {
+  pathId: string
+  items: BatchItem[]
+  running: boolean
+  stopping: boolean
 }

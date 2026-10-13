@@ -99,6 +99,13 @@ Subjects (left rail) → Branches → Courses → Syllabus → Chapter text
     (newest, recently changed, A–Z, due soonest, least time left, most progress), with
     **✦ New with AI** / **+ Empty** at the bottom (laid out like Cal). The open path shows on the right. New paths start
     *Not scheduled*; **📅 Schedule this path**, **Unschedule**, **🗄 Archive** / **Restore**.
+    **🎧 Lectures** on a path does the whole path in a few taps: tick chapters (a course step
+    brings all its chapters), pick how thorough (**Fast** write only, **Checked** fact-check,
+    **Thorough** fact-check then fix flagged errors), a length for all (each chapter can
+    override) and the voice, then **Start**. It writes, checks and records two chapters at a
+    time in the background (a pill shows progress; the screen is kept awake where supported).
+    Anything already done is skipped, so **Start** again resumes after a stop. Then **▶ Play
+    all** or **+ Queue all**.
     AI drafting: goal + pasted assignment + photos/PDFs → subject › branch › course › chapter
     steps (`google/gemini-3.8-flash`); **Create** reuses matches and generates anything missing.
   - **Cal** — the scheduled paths in **priority order** (top first) with their status (on track,
@@ -156,7 +163,9 @@ A **Study tools** switch in the reader (off by default, synced across devices) r
   download, transcript and delete (removes the MP3 too). Lectures play in an app-wide
   player bar that keeps going when the sheet closes or you move around (lock-screen/headphone
   controls, ±15 s, speed); each lecture remembers where you stopped and shows ✓ Listened once
-  finished, synced across devices. Every lecture is also under **Library → Lectures**. Voice model, voice, style and speed live in Settings (synced); the voice
+  finished, synced across devices. **+ Queue** on any lecture adds it to the listening queue
+  (☰ on the player bar: reorder, remove, play one now, clear); the next one starts when a lecture
+  ends, and the queue syncs across devices. Every lecture is also under **Library → Lectures**. Voice model, voice, style and speed live in Settings (synced); the voice
   list comes live from OpenRouter so only supported voices are offered.
 - **📊 Add a chart** for a section: the AI picks a line / bar / scatter / pie chart or a flow
   diagram (or draws the one you describe). Charts become part of that section for good, so each
@@ -177,6 +186,7 @@ is written in the background while you read.
 - Writing: DeepSeek (`deepseek/deepseek-chat`). Fact-checks: `perplexity/sonar`.
 - Lectures: `netlify/edge-functions/speech.ts` (`POST /api/speech`); default voice model `microsoft/mai-voice-2.1-flash` (voice Harper, en-US); any of OpenRouter's speech models can be chosen in Settings, and if the preferred one isn't listed the closest listed one is used. Raw-PCM models are saved as WAV.
 - Models and keys: see [Choosing your models](#choosing-your-models).
+- Rate limits: a 429 from OpenRouter is retried up to 3 times (`postCompletion` in `prompts.ts`; `Retry-After` up to 5s, else 1s, 2s, 4s). A Settings key that is rejected (401/403) or still rate-limited falls back to the site key. Errors show OpenRouter's reason.
 
 ## Password
 
